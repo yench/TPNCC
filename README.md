@@ -1,5 +1,5 @@
 # TPNCC
-R code for "Improved prediction of transition probabilities in multi-state models with nested case-control data" by Yen Chang, Jason P. Fine, Demetrius Albanes, and Yei Eun Shin. 
+R code for "Improved prediction of transition probabilities in multi-state models with nested case-control data" by Yen Chang, Anastasia Ivanova, Jason P. Fine, Demetrius Albanes, and Yei Eun Shin. 
 
 ## Competing risks
 - cr_analysis.R: for predicting transition probabilities in the competing risks model with weight calibration and/or the proportional baselines model 
