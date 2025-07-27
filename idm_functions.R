@@ -1,13 +1,16 @@
-# exponential illness-death model data
-simul.idm = function(n, mctrl=1, 
-                     max.diag.t=6, max.death.t=10,          # administrative censoring times
-                     max.enter=2, Smax.censor=0.9, 
-                     Smax12=0.98, beta121=0.2, beta122=0.5,   # hazard 1->2   
-                     Smax13=0.90, beta131=0.1, beta132=0.4, # hazard 1->3
-                     Smax23=0.70, beta231=0.3, beta232=0.7, # hazard 2->3 
-                     mu=c(z1=0, z2=0, u=0),
-                     sig=c(sdz1=1, sdz2=1, sdu=1),
-                     cov12=0, cov1u=0, cov2u=0.75){    
+# Weibull illness-death model data
+simul.idm = function(n,               # cohort size
+                     mctrl=1,         # number of controls per case
+                     max.diag.t=6,    # administrative censoring time of the NCC study
+                     max.death.t=10,  # administrative censoring time of cohort follow-up
+                     max.enter=2,     # maximum late entry time into the cohort
+                     Smax.censor=0.9, # baseline survival fraction from random censoring
+                     Smax12=0.98, beta121=0.2, beta122=0.5, alpha12=2, # parameters for 1->2 transition   
+                     Smax13=0.90, beta131=0.1, beta132=0.4, alpha13=2, # parameters for 1->3 transition
+                     Smax23=0.70, beta231=0.3, beta232=0.7, alpha23=2, # parameters for 2->3 transition 
+                     mu=c(z1=0, z2=0, u=0),                 # mean of Z1, Z2, and U
+                     sig=c(sdz1=1, sdz2=1, sdu=1),          # marginal variance of Z1, Z2, and U 
+                     cov12=0, cov1u=0, cov2u=0.75){         # cov(Z1, Z2), cov(Z1, U), cov(Z2, U)
   
   Sig = matrix(0, nrow=3, ncol=3); diag(Sig) = sig^2
   Sig[upper.tri(Sig)] = c(cov12, cov1u, cov2u)
@@ -15,9 +18,9 @@ simul.idm = function(n, mctrl=1,
   Covmat = data.table(MASS::mvrnorm(n=n, mu=mu, Sigma=Sig))
   
   # coefficients
-  gamma12 = log(-log(Smax12)/max.death.t)
-  gamma13 = log(-log(Smax13)/max.death.t)
-  gamma23 = log(-log(Smax23)/max.death.t)
+  gamma12 = log(-log(Smax12)/(max.death.t^alpha12))
+  gamma13 = log(-log(Smax13)/(max.death.t^alpha13))
+  gamma23 = log(-log(Smax23)/(max.death.t^alpha23))
   
   eta12 = with(Covmat, exp((gamma12 + beta121*z1 + beta122*z2)))
   eta13 = with(Covmat, exp((gamma13 + beta131*z1 + beta132*z2)))
@@ -28,17 +31,20 @@ simul.idm = function(n, mctrl=1,
   droptime = rexp(n, rate=-log(Smax.censor)/max.death.t) # drop out for any reason
   censtime = pmin(max.death.t-entrtime, droptime) # end of study
   
-  hldtime1 = rexp(n, rate=eta12+eta13)
-  hldtime2 = rexp(n, rate=eta23)
-  nonttime = pmin(hldtime1, censtime)
-  ind.jmp1 = as.integer(hldtime1<censtime)
-  ind.nont = ifelse(ind.jmp1==1, rbinom(n, 1, prob=eta12/(eta12+eta13)), 0)
-  termtime = ifelse(ind.jmp1==1 & ind.nont==0, hldtime1, pmin(hldtime1+hldtime2, censtime))
+  evntime12 = rweibull(n, shape=alpha12, scale=eta12^(-1/alpha12))
+  evntime13 = rweibull(n, shape=alpha13, scale=eta13^(-1/alpha13))
+  evntime1 = pmin(evntime12, evntime13)
+  evntime23 = (evntime12^alpha23-log(1-runif(n))/eta23)^(1/alpha23)
+  
+  nonttime = pmin(evntime1, censtime)
+  ind.jmp1 = as.integer(evntime1<censtime)
+  ind.nont = ifelse(ind.jmp1==1, as.integer(evntime12<evntime13), 0)
+  termtime = ifelse(ind.jmp1==1 & ind.nont==0, evntime1, pmin(evntime23, censtime))
   ind.term = as.integer(termtime<censtime)
   
   # generate diagnosis time subject to the administrative censoring time of the incidence study
-  diagtime = pmin(max.diag.t-entrtime, droptime, hldtime1)
-  ind.diag = as.integer(ind.nont==1 & hldtime1<pmin(droptime, max.diag.t-entrtime))
+  diagtime = pmin(max.diag.t-entrtime, droptime, evntime1)
+  ind.diag = as.integer(ind.nont==1 & evntime1<pmin(droptime, max.diag.t-entrtime))
   
   DATA = data.table(ID=1:n, Covmat, diagtime=diagtime, ind.diag=ind.diag, 
                     nonttime=nonttime, ind.12=ind.nont, termtime=termtime, 
@@ -84,7 +90,11 @@ simul.idm = function(n, mctrl=1,
 
 
 # Breslow-type calibration
-calib_bre = function (datph1, trantime, status.var, covars){
+calib_bre = function (datph1,     # full cohort data (replicated or not) 
+                      trantime,   # name of the transition time
+                      status.var, # name of the transition status
+                      covars){    # names of covariates used in step 2 of weight calibration
+                                  # include fully observed covariates and predicted values of partially observed covariates
   subset = datph1[ , ind.ncc]
   wgts = datph1[ , wgt]
   
@@ -95,12 +105,16 @@ calib_bre = function (datph1, trantime, status.var, covars){
   g = rakecal(A[subset, ], wgts[subset], colSums(A))
   if(is.null(g)) {print(paste("Brewgt", substr(status.var, 5, 6), "did not converge")); return(NULL)}
   
-  return(list(wgt = g, A = A))
+  return(list(wgt = g, A = A))    # wgt = Breslow weight, A = matrix of auxiliary variables for the Breslow weight calibration procedure
 }
 
 
 # raking
-rakecal = function(A, w0, total, max_iter=500, EPS=1e-11, eta=TRUE){
+rakecal = function(A,            # matrix of auxiliary variables among those in the NCC sample
+                   w0,           # design weights among those in the NCC sample
+                   total,        # sum of auxiliary variables in the full cohort
+                   max_iter=500, # maximum number of iterations
+                   EPS=1e-11){   # threshold for convergence{
   
   lambda = as.matrix(rep(0, ncol(A)))
   w1 = as.vector(w0 * exp(A %*% lambda))
@@ -129,60 +143,70 @@ rakecal = function(A, w0, total, max_iter=500, EPS=1e-11, eta=TRUE){
     g = NULL
   } else g = w1
   
-  if(eta== T) attributes(g) <- list(lambda = lambda1)
+  attributes(g) <- list(lambda = lambda1)
   
-  return(g)
+  return(g) # calibrated weights
 } 
 
-
-# beta and lambda
-coxModel = function (datph1, datph1.repli, tau, method, jcov.byp=NULL, cal=NULL){
+## fits the standard and proportional baselines model, estimate baseline intensities and predict transition probabilities
+coxModel = function (datph1,        # full cohort data
+                     datph1.repli,  # replicated full cohort data for the proportional baselines model
+                     tau,           # tau = (tau0, tau1], the interval to obtain prediction for
+                     method,        # "ful" = full cohort,    "des" = design weight
+                                    # "bre" = Breslow weight, "shi" = Shin weight
+                     jcov.byp=NULL, # matrix for joint inclusion probabilities (required for all weighted analyses)
+                     cal=NULL){     # list of weights and matrices of auxiliary variables (required for calibrated weights)
+                                    # list(wgt12=, A12=, wgt13=, A13=, wgt23=, A23=, wgt1=, A1=)
+                                    #      standard model                            proportional baselines model
   nfull = nrow(datph1)          # cohort size
-  subset2 = (datph1$ind.12==1)  # indicator of experiencing the 1-2 transition
-  n2 = sum(subset2)             # number of 1-2 transitions in the cohort
+  subset2 = (datph1$ind.12==1)  # indicator of experiencing a 1->2 transition
+  n2 = sum(subset2)             # number of 1->2 transitions in the cohort
   
   #### beta: relative hazards ####
   if(method=="ful") { # full cohort analysis
-    subset1 = rep(TRUE, nfull) 
+    subset1 = rep(TRUE, nfull)  # include all subjects in the analysis
     wgt12 = wgt13 = rep(1, nfull)
     wgt23 = rep(1, n2)
     wgt1 = rep(1, 2*nfull)
-    dftype = "bint"
-    
+    dfeta = FALSE
+
   } else { # analysis with NCC data
-    subset1 = datph1$ind.ncc
+    subset1 = datph1$ind.ncc   # include thoe in the NCC sample in the analysis
     
     if(method=="des"){ # Design weights
       wgt12 = wgt13 = datph1[subset1, wgt]
       wgt23 = datph1[subset1 & subset2, wgt]
       wgt1 = rep(wgt12, each=2)
-      dftype = "bint"
-      
+      dfeta = FALSE
+
     } else if(method %in% c("bre", "shi")){  # calibrated weights
       wgt12 = cal$wgt12
       wgt13 = cal$wgt13 
       wgt23 = cal$wgt23
       wgt1  = cal$wgt1
-      dftype = c("eta", "bint")} 
+      dfeta = TRUE} 
   }
+  #### fitting standard models ####
   fit12 = coxph(Surv(nonttime, ind.12) ~ z1 + z2, data=datph1[subset1], weights=wgt12, timefix=FALSE) 
   fit13 = coxph(Surv(nonttime, ind.13) ~ z1 + z2, data=datph1[subset1], weights=wgt13, timefix=FALSE)
   fit23 = coxph(Surv(nonttime, termtime, ind.23) ~ z1 + z2, data=datph1[subset1 & subset2, ], weights=wgt23, timefix=FALSE)
+  #### fitting proportional baselines model to transitions out of the healthy state ####
   fit1 =  coxph(Surv(nonttime, ind.1) ~ z1 + z2 + z3 + z4 + z5, data=datph1.repli[rep(subset1, each=2)], weights=wgt1, timefix=FALSE)
   
   #### dLambdas: baseline intensities ####
-  #### compute influence functions of eta, beta, and dLambda ####
-  df2.12 = df.coxph(fit12, type=dftype, fullA=cal$A12, subset=subset1)
-  df2.13 = df.coxph(fit13, type=dftype, fullA=cal$A13, subset=subset1)
-  df2.23 = df.coxph(fit23, type=dftype, fullA=cal$A23, subset=datph1[subset2, ind.ncc])
-  df2.1  = df.coxph(fit1,  type=dftype, fullA=cal$A1,  subset=rep(subset1, each=2), pb=TRUE)
+  #### compute IF_1i of eta, beta, and dLambda ####
+  df2.12 = df.coxph(fit12, dfeta=dfeta, fullA=cal$A12, subset=subset1)
+  df2.13 = df.coxph(fit13, dfeta=dfeta, fullA=cal$A13, subset=subset1)
+  df2.23 = df.coxph(fit23, dfeta=dfeta, fullA=cal$A23, subset=datph1[subset2, ind.ncc])
+  df2.1  = df.coxph(fit1,  dfeta=dfeta, fullA=cal$A1,  subset=rep(subset1, each=2), pb=TRUE)
   df20.12 = df20.13 = df20.23 = df20.1 = NULL
   
-  if (method %in% c("bre", "shi")){
-    df20.12 = df.coxph(fit12, type=dftype, fullA=cal$A12, subset=subset1, omg=TRUE)
-    df20.13 = df.coxph(fit13, type=dftype, fullA=cal$A13, subset=subset1, omg=TRUE)
-    df20.23 = df.coxph(fit23, type=dftype, fullA=cal$A23, subset=datph1[subset2, ind.ncc], omg=TRUE)
-    df20.1 =  df.coxph(fit1,  type=dftype, fullA=cal$A1,  subset=rep(subset1, each=2), omg=TRUE, pb=TRUE)
+  #### compute IF_2i of eta, beta, and dLambda ####
+  if (method %in% c("bre", "shi")){ 
+    df20.12 = df.coxph(fit12, dfeta=dfeta, fullA=cal$A12, subset=subset1, omg=TRUE)
+    df20.13 = df.coxph(fit13, dfeta=dfeta, fullA=cal$A13, subset=subset1, omg=TRUE)
+    df20.23 = df.coxph(fit23, dfeta=dfeta, fullA=cal$A23, subset=datph1[subset2, ind.ncc], omg=TRUE)
+    df20.1 =  df.coxph(fit1,  dfeta=dfeta, fullA=cal$A1,  subset=rep(subset1, each=2), omg=TRUE, pb=TRUE)
   }
  
   #### objects for computation of variance ####
@@ -217,6 +241,7 @@ coxModel = function (datph1, datph1.repli, tau, method, jcov.byp=NULL, cal=NULL)
   bInt1  = sum(df2.1$bint[bint1.idx])
   bInt13.pb = bInt1*exp(fit1$coefficients["z3"])
   
+  #### SE of Lambda ####
   se.bInt12 = se.comp(as.matrix(rowSums(df2.12$df_bint[ , bint12.idx])), as.matrix(rowSums(df20.12$df_bint[ , bint12.idx])), se.comp.ls)
   se.bInt13 = se.comp(as.matrix(rowSums(df2.13$df_bint[ , bint13.idx])), as.matrix(rowSums(df20.13$df_bint[ , bint13.idx])), se.comp.ls)
   se.bInt23 = se.comp(as.matrix(rowSums(df2.23$df_bint[ , bint23.idx])), as.matrix(rowSums(df20.23$df_bint[ , bint23.idx])), se.comp.ls2)
@@ -251,16 +276,19 @@ coxModel = function (datph1, datph1.repli, tau, method, jcov.byp=NULL, cal=NULL)
   
   out.sd = data.table(out.sd, method = method, type = c("est", "se"), model = "sd")
   out.pb = data.table(out.pb, method = method, type = c("est", "se"), model = "pb")
-  
-  return(rbind(out.pb, out.sd, fill=TRUE)) 
+  out = rbind(out.pb, out.sd, fill=TRUE) # estimates/predictions and SE 
+  return(list(out = out, bint12 = df2.12$bint, bint13 = df2.13$bint))
 }
 
 
-# transition probabilities
-tp.sd = function(t.table, zstar, tau, se.comp.ls, subset2,
-                 beta12, df12, df012,
-                 beta13, df13, df013,
-                 beta23, df23, df023){
+# predict transition probabilities using the AJ estimator 
+tp.sd = function(t.table,    # lookup table for indexing transition times within tau
+                 zstar, tau, # covariates and time intervals to obtain predictions for    
+                 se.comp.ls, # list of objects needed for computing SE
+                 subset2,    # TRUE/FALSE vector of indicators for subjects ever in state 2
+                 beta12, df12, df012,  # betas and baseline intensity estimates, and their influence functions for 1->2 transitions
+                 beta13, df13, df013,  # betas and baseline intensity estimates, and their influence functions for 1->3 transitions
+                 beta23, df23, df023){ # betas and baseline intensity estimates, and their influence functions for 2->3 transitions
   d = t.table[tau[1]<tj & tj<=tau[2], .N]
   nzstar = nrow(zstar)
   
@@ -283,13 +311,13 @@ tp.sd = function(t.table, zstar, tau, se.comp.ls, subset2,
   P = lapply(1:nzstar, function(x){c(P11 = P.ret[[x]]$P[1, 1], P12 = P.ret[[x]]$P[1, 2], P13 = P.ret[[x]]$P[1, 3], P23 = P.ret[[x]]$P[2, 3])})
   se = lapply(1:nzstar, function(x){se.comp(P.ret[[x]]$df_P, P.ret[[x]]$df_P0, se.comp.ls, c(rep(se.comp.ls$nh, 3), se.comp.ls$n2))})
   out = lapply(1:nzstar, function(x){list(P = P[[x]], se = se[[x]])})
-  return(out)
+  return(out) # list of predicted transition probabilities and their SE
 }
 
 
-tp.pb = function(t.table, zstar, tau, se.comp.ls, subset2,
-                 beta1, df1, df01,
-                 beta2, df2, df02){
+tp.pb = function(t.table, zstar, tau, se.comp.ls, subset2, # see comments for tp.sd()
+                 beta1, df1, df01,  # betas and baseline intensity estimates and their influence functions for transition out of state 1
+                 beta2, df2, df02){ # betas and baseline intensity estimates and their influence functions for transition out of state 2
   d = t.table[tau[1]<tj & tj<=tau[2], .N]
   d1 = t.table[tau[1]<tj & tj<=tau[2] & hk %in% c(12,13), .N]
   nzstar = nrow(zstar)
@@ -311,12 +339,17 @@ tp.pb = function(t.table, zstar, tau, se.comp.ls, subset2,
   P = lapply(1:nzstar, function(x){c(P11 = P.ret[[x]]$P[1, 1], P12 = P.ret[[x]]$P[1, 2], P13 = P.ret[[x]]$P[1, 3], P23 = P.ret[[x]]$P[2, 3])})
   se = lapply(1:nzstar, function(x){se.comp(P.ret[[x]]$df_P, P.ret[[x]]$df_P0, se.comp.ls, c(rep(se.comp.ls$nh, 3), se.comp.ls$n2))})
   out = lapply(1:nzstar, function(x){list(P = P[[x]], se = se[[x]])})
-  return(out)
+  return(out) # list of predicted transition probabilities and their SE
 }
 
 
 # influence functions of log-relative hazards and baseline intensities
-df.coxph = function(coxph_object, type=c("eta", "bint"), fullA=NULL, subset=NULL, omg=FALSE, pb=FALSE){
+df.coxph = function(coxph_object, # a coxph object from fitting the standard or the proportional baselines model
+                    dfeta=TRUE,   # compute IF(eta)? TRUE for calibrated weights
+                    fullA=NULL,   # NULL for full cohort and design weights, the matrix of auxiliary variables for calibrated weights 
+                    subset=NULL,  # a vector of TRUE/FALSE indicators for inclusion in the analysis
+                    omg=FALSE,    # FALSE to compute IF_i, TRUE to compute IF_2i
+                    pb=FALSE){    # TRUE if the coxph object comes from fitting a proportional baselines model
   
   coxph_detail = coxph.detail(coxph_object)
   if(is.null(coxph_detail$nevent.wt)) {
@@ -348,7 +381,7 @@ df.coxph = function(coxph_object, type=c("eta", "bint"), fullA=NULL, subset=NULL
   if(is.null(naive.var)) naive.var = matrix(0, 2, 2)
   
   ret = dfbetaint(Z, fullA, naive.var, eqbeta, df_beta, wexpbZ, trantime, rep(lefttime, ifelse(length(lefttime)==1, nsub, 1)), eventime,
-                  wgt, nevent.wt, which(subset)-1, trantime.order, nsub, ntime, nbeta, "eta" %in% type, "bint" %in% type, omg)
+                  wgt, nevent.wt, which(subset)-1, trantime.order, nsub, ntime, nbeta, dfeta, omg)
   
   if(pb==TRUE){
     ret$df_beta = sum2(ret$df_beta)
@@ -359,12 +392,16 @@ df.coxph = function(coxph_object, type=c("eta", "bint"), fullA=NULL, subset=NULL
   bint = ret$bint
   attr(bint, "time") = trantime
   
-  return(list(bint = bint, df_beta = ret$df_beta, df_bint = ret$df_lambda))
+  return(list(bint = bint,              # estimated increments in the baseline intensity
+              df_beta = ret$df_beta,    # influence functions of betas
+              df_bint = ret$df_lambda)) # influence functions of increments in the baseline intensity
+   
 }
 
 
 # joint inclusion probabilities
-jointVP = function(datph2, m){
+jointVP = function(datph2,   # the NCC data 
+                   m){       # number of controls per case
   control.num = sum(datph2$ind.diag==0)
   case.times = datph2[ind.diag==1, diagtime, drop=TRUE]
   control.times = datph2[ind.diag==0, diagtime, drop=TRUE]

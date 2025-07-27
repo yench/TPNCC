@@ -10,7 +10,7 @@ List dfbetaint (const arma::mat& Z, const arma::mat& fullA, const arma::mat& nai
                 const arma::vec& wgt, const arma::vec& nevent_wt,
                 const arma::uvec& subset, const arma::uvec& trantime_order,
                 int& nsub, int& ntime, int& nbeta,
-                bool& eta, bool& bint, bool& omg){
+                bool& eta, bool& omg){
   
   arma::mat S1(ntime, nbeta);
   arma::vec S0(ntime);
